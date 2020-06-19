@@ -1,0 +1,1105 @@
+# -*- coding: utf-8 -*-
+
+#
+# Copyright (c) 2017-2018, Juniper Networks Inc. All rights reserved.
+#
+# License: Apache 2.0
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in the
+#   documentation and/or other materials provided with the distribution.
+#
+# * Neither the name of the Juniper Networks nor the
+#   names of its contributors may be used to endorse or promote products
+#   derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY Juniper Networks, Inc. ''AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL Juniper Networks, Inc. BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+from __future__ import absolute_import, division, print_function
+
+# Ansible imports
+from ansible.module_utils.connection import Connection
+from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.basic import boolean
+from ansible.module_utils._text import to_bytes, to_text
+
+# Standard library imports
+from argparse import ArgumentParser
+from distutils.version import LooseVersion
+import json
+import logging
+import os
+import pickle
+
+# Non-standard library imports and checks
+try:
+    from jnpr.junos.version import VERSION
+
+    HAS_PYEZ_VERSION = VERSION
+except ImportError:
+    HAS_PYEZ_VERSION = None
+
+try:
+    import jnpr.junos.device
+
+    HAS_PYEZ_DEVICE = True
+except ImportError:
+    HAS_PYEZ_DEVICE = False
+
+try:
+    import jnpr.junos.utils.sw
+
+    HAS_PYEZ_SW = True
+except ImportError:
+    HAS_PYEZ_SW = False
+
+try:
+    import jnpr.junos.utils.config
+
+    HAS_PYEZ_CONFIG = True
+except ImportError:
+    HAS_PYEZ_CONFIG = False
+
+try:
+    import jnpr.junos.op
+    import jnpr.junos.factory.factory_loader
+    import jnpr.junos.factory.table
+
+    HAS_PYEZ_OP_TABLE = True
+except ImportError:
+    HAS_PYEZ_OP_TABLE = False
+
+try:
+    import jnpr.junos.exception as pyez_exception
+
+    HAS_PYEZ_EXCEPTIONS = True
+except ImportError:
+    HAS_PYEZ_EXCEPTIONS = False
+
+try:
+    import jnpr.jsnapy
+
+    HAS_JSNAPY_VERSION = jnpr.jsnapy.__version__
+except ImportError:
+    HAS_JSNAPY_VERSION = None
+# Most likely JSNAPy 1.2.0 with https://github.com/Juniper/jsnapy/issues/263
+except TypeError:
+    HAS_JSNAPY_VERSION = 'possibly 1.2.0'
+
+try:
+    from lxml import etree
+
+    HAS_LXML_ETREE_VERSION = '.'.join(map(str, etree.LXML_VERSION))
+except ImportError:
+    HAS_LXML_ETREE_VERSION = None
+
+try:
+    import jxmlease
+
+    HAS_JXMLEASE_VERSION = jxmlease.__version__
+except ImportError:
+    HAS_JXMLEASE_VERSION = None
+
+try:
+    import yaml
+
+    HAS_YAML_VERSION = yaml.__version__
+except ImportError:
+    HAS_YAML_VERSION = None
+
+try:
+    # Python 2
+    basestring
+except NameError:
+    # Python 3
+    basestring = str
+
+# Constants
+# Minimum PyEZ version required by shared code.
+MIN_PYEZ_VERSION = "2.2.0"
+# Installation URL for PyEZ.
+PYEZ_INSTALLATION_URL = "https://github.com/Juniper/py-junos-eznc#installation"
+# Minimum lxml version required by shared code.
+MIN_LXML_ETREE_VERSION = "3.2.4"
+# Installation URL for LXML.
+LXML_ETREE_INSTALLATION_URL = "http://lxml.de/installation.html"
+# Minimum JSNAPy version required by shared code.
+MIN_JSNAPY_VERSION = "1.2.1"
+# Installation URL for JSNAPy.
+JSNAPY_INSTALLATION_URL = "https://github.com/Juniper/jsnapy#installation"
+# Minimum jxmlease version required by shared code.
+MIN_JXMLEASE_VERSION = "1.0.1"
+# Installation URL for jxmlease.
+JXMLEASE_INSTALLATION_URL = \
+    "http://jxmlease.readthedocs.io/en/stable/install.html"
+# Minimum yaml version required by shared code.
+MIN_YAML_VERSION = "3.08"
+YAML_INSTALLATION_URL = "http://pyyaml.org/wiki/PyYAMLDocumentation"
+
+# Known RPC output formats
+RPC_OUTPUT_FORMAT_CHOICES = ['text', 'xml', 'json']
+
+# Known configuration formats
+CONFIG_FORMAT_CHOICES = ['xml', 'set', 'text', 'json']
+# Known configuration databases
+CONFIG_DATABASE_CHOICES = ['candidate', 'committed']
+# Known configuration actions
+CONFIG_ACTION_CHOICES = ['set', 'merge', 'update',
+                         'replace', 'override', 'overwrite']
+# Supported configuration modes
+CONFIG_MODE_CHOICES = ['exclusive', 'private']
+# Supported configuration models
+CONFIG_MODEL_CHOICES = ['openconfig', 'custom', 'ietf', 'True']
+
+# Other logging names which should be logged to the logfile
+additional_logger_names = ['ncclient', 'paramiko']
+
+# Specify the logging spec.
+logging_spec = {
+    'logfile': dict(type='path', required=False, default=None),
+    'logdir': dict(type='path', required=False, default=None),
+    'level': dict(choices=[None, 'INFO', 'DEBUG'], required=False, default=None)
+}
+import q
+def get_connection(module):
+    if hasattr(module, "_pyez_connection"):
+        return module._pyez_connection
+    capabilities = get_capabilities(module)
+    network_api = capabilities.get("network_api")
+    if network_api == "pyez":
+        module._pyez_connection = Connection(module._socket_path)
+    else:
+        module.fail_json(msg="Invalid connection type %s" % network_api)
+    return module._pyez_connection
+
+
+def get_capabilities(module):
+    if hasattr(module, "_pyez_junos_capabilities"):
+        return module._pyez_junos_capabilities
+    try:
+        capabilities = Connection(module._socket_path).get_capabilities()
+    except ConnectionError as exc:
+        module.fail_json(msg=to_text(exc, errors="surrogate_then_replace"))
+    module._pyez_junos_capabilities = json.loads(capabilities)
+    return module._pyez_junos_capabilities
+
+class JuniperJunosModule(AnsibleModule):
+    """A subclass of AnsibleModule used by all juniper_junos_* modules.
+
+    All juniper_junos_* modules share common behavior which is implemented in
+    this class.
+
+    Attributes:
+        dev: An instance of a PyEZ Device() object.
+
+    Public Methods:
+        exit_json: Close self.dev and call parent's exit_json().
+        fail_json: Close self.dev and call parent's fail_json().
+        check_pyez: Verify the PyEZ library is present and functional.
+        check_jsnapy: Verify the JSNAPy library is present and functional.
+        check_jxmlease: Verify the Jxmlease library is present and functional.
+        check_lxml_etree: Verify the lxml Etree library is present and
+                          functional.
+        check_yaml: Verify the YAML library is present and functional.
+        parse_arg_to_list_of_dicts: Parses string_val into a list of dicts.
+        parse_ignore_warning_option: Parses the ignore_warning option.
+        parse_rollback_option: Parses the rollback option.
+        open: Open self.dev.
+        close: Close self.dev.
+        add_sw: Add an instance of jnp.junos.utils.sw.SW() to self.
+        open_configuration: Open cand. conf. db in exclusive or private mode.
+        close_configuration: Close candidate configuration database.
+        get_configuration: Return the device config. in the specified format.
+        rollback_configuration: Rollback device config. to the specified id.
+        check_configuration: Check the candidate configuration.
+        diff_configuration: Diff the candidate and committed configurations.
+        load_configuration: Load the candidate configuration.
+        commit_configuration: Commit the candidate configuration.
+        ping: Execute a ping command from a Junos device.
+        save_text_output: Save text output into a file.
+    """
+
+    # Method overrides
+    def __init__(self,
+                 argument_spec={},
+                 mutually_exclusive=[],
+                 min_pyez_version=MIN_PYEZ_VERSION,
+                 min_lxml_etree_version=MIN_LXML_ETREE_VERSION,
+                 min_jsnapy_version=None,
+                 min_jxmlease_version=None,
+                 min_yaml_version=None,
+                 **kwargs):
+        """Initialize a new JuniperJunosModule instance.
+
+        Combines module-specific parameters with the common parameters shared
+        by all juniper_junos_* modules. Performs additional checks on options.
+        Collapses any provider options to be top-level options. Checks the
+        minimum PyEZ version. Creates and opens the PyEZ Device instance.
+
+        Args:
+            agument_spec: Module-specific argument_spec added to top_spec.
+            mutually_exclusive: Module-specific mutually exclusive added to
+                                top_spec_mutually_exclusive.
+            min_pyez_version: The minimum PyEZ version required by the module.
+                              Since all modules require PyEZ this defaults to
+                              MIN_PYEZ_VERSION.
+            min_lxml_etree_version: The minimum lxml Etree version required by
+                                    the module. Since most modules require
+                                    lxml Etree this defaults to
+                                    MIN_LXML_ETREE_VERSION.
+            min_jsnapy_version: The minimum JSNAPy version required by the
+                                module. If this is None, the default, it
+                                means the module does not explicitly require
+                                jsnapy.
+            min_jxmlease_version: The minimum Jxmlease version required by the
+                                  module. If this is None, the default, it
+                                  means the module does not explicitly require
+                                  jxmlease.
+            min_yanml_version: The minimum YAML version required by the
+                               module. If this is None, the default, it
+                               means the module does not explicitly require
+                               yaml.
+            **kwargs: All additional keyword arguments are passed to
+                      AnsibleModule.__init__().
+
+        Returns:
+            A JuniperJunosModule instance object.
+        """
+        # Initialize the dev attribute
+        self.dev = None
+
+        # Initialize the config attribute
+        self.config = None
+        # Call parent's __init__()
+        argument_spec.update(logging_spec)
+        super(JuniperJunosModule, self).__init__(
+            argument_spec=argument_spec,
+            mutually_exclusive=mutually_exclusive,
+            **kwargs)
+
+        self._pyez_conn = get_connection(self)
+
+        # connect_args = {}
+        # connect_args['host'] = self._pyez_conn.get_option('host')
+        # connect_args['user'] = self._pyez_conn.get_option('remote_user')
+        # connect_args['passwd'] = self._pyez_conn.get_option('password')
+        # connect_args['ssh_private_key_file'] = self._pyez_conn.get_option('private_key_file')
+        # connect_args['ssh_config'] = self._pyez_conn.get_option('pyez_ssh_config')
+        # connect_args['timeout'] = self._pyez_conn.get_option('persistent_connect_timeout')
+
+        # Check PyEZ version and add attributes to reach PyEZ components.
+        self.check_pyez(min_pyez_version,
+                        check_device=True,
+                        check_sw=True,
+                        check_config=True,
+                        check_op_table=True,
+                        check_exception=True)
+        self.pyez_factory_loader = jnpr.junos.factory.factory_loader
+        self.pyez_factory_table = jnpr.junos.factory.table
+        self.pyez_op_table = jnpr.junos.op
+        self.pyez_exception = pyez_exception
+        # Check LXML Etree.
+        self.check_lxml_etree(min_lxml_etree_version)
+        self.etree = etree
+        # Check jsnapy if needed.
+        if min_jsnapy_version is not None:
+            self.check_jsnapy(min_jsnapy_version)
+            if hasattr(jnpr, 'jsnapy'):
+                self.jsnapy = jnpr.jsnapy
+            else:
+                self.fail_json("JSNAPy not available.")
+        # Check jxmlease if needed.
+        if min_jxmlease_version is not None:
+            self.check_jxmlease(min_jxmlease_version)
+            self.jxmlease = jxmlease
+        # Check yaml if needed.
+        if min_yaml_version is not None:
+            self.check_yaml(min_yaml_version)
+            self.yaml = yaml
+
+        self.module_name = self._name
+        # Setup logging.
+        self.logger = self._setup_logging()
+
+    def exit_json(self, **kwargs):
+        """Close self.dev and call parent's exit_json().
+
+        Args:
+            **kwargs: All keyword arguments are passed to
+                      AnsibleModule.exit_json().
+        """
+        # Close the connection.
+        #self.close()
+        self.logger.debug("Exit JSON: %s", kwargs)
+        # Call the parent's exit_json()
+        super(JuniperJunosModule, self).exit_json(**kwargs)
+
+    def fail_json(self, **kwargs):
+        """Close self.dev and call parent's fail_json().
+
+        Args:
+            **kwargs: All keyword arguments are passed to
+                      AnsibleModule.fail_json().
+        """
+        # Close the configuration
+        self.close_configuration()
+        # Close the connection.
+        #self._pyez_conn.close()
+        if hasattr(self, 'logger'):
+            self.logger.debug("Fail JSON: %s", kwargs)
+        # Call the parent's fail_json()
+        super(JuniperJunosModule, self).fail_json(**kwargs)
+
+    # JuniperJunosModule-specific methods below this point.
+    def _check_library(self,
+                       library_name,
+                       installed_version,
+                       installation_url,
+                       minimum=None,
+                       library_nickname=None):
+        """Check if library_name is installed and version is >= minimum.
+
+        Args:
+            library_name: The name of the library to check.
+            installed_version: The currently installed version, or None if it's
+                               not installed.
+            installation_url: The URL with instructions on installing
+                              library_name
+            minimum: The minimum version required.
+                     Default = None which means no version check.
+            library_nickname: The library name with any nickname.
+                     Default = library_name.
+        Failures:
+            - library_name not installed (unable to import).
+            - library_name installed_version < minimum.
+        """
+        if library_nickname is None:
+            library_nickname = library_name
+        if installed_version is None:
+            if minimum is not None:
+                self.fail_json(msg='%s >= %s is required for this module. '
+                                   'However, %s does not appear to be '
+                                   'currently installed. See %s for '
+                                   'details on installing %s.' %
+                                   (library_nickname, minimum, library_name,
+                                    installation_url, library_name))
+            else:
+                self.fail_json(msg='%s is required for this module. However, '
+                                   '%s does not appear to be currently '
+                                   'installed. See %s for details on '
+                                   'installing %s.' %
+                                   (library_nickname, library_name,
+                                    installation_url, library_name))
+        elif installed_version is not None and minimum is not None:
+            if not LooseVersion(installed_version) >= LooseVersion(minimum):
+                self.fail_json(
+                    msg='%s >= %s is required for this module. Version %s of '
+                        '%s is currently installed. See %s for details on '
+                        'upgrading %s.' %
+                        (library_nickname, minimum, installed_version,
+                         library_name, installation_url, library_name))
+
+    def check_pyez(self, minimum=None,
+                   check_device=False,
+                   check_sw=False,
+                   check_config=False,
+                   check_op_table=False,
+                   check_exception=False):
+        """Check PyEZ is available and version is >= minimum.
+
+        Args:
+            minimum: The minimum PyEZ version required.
+                     Default = None which means no version check.
+            check_device: Indicates whether to check for PyEZ Device object.
+            check_exception: Indicates whether to check for PyEZ exceptions.
+
+        Failures:
+            - PyEZ not installed (unable to import).
+            - PyEZ version < minimum.
+            - check_device and PyEZ Device object can't be imported
+            - check_exception and PyEZ exceptions can't be imported
+        """
+        self._check_library('junos-eznc', HAS_PYEZ_VERSION,
+                            PYEZ_INSTALLATION_URL, minimum=minimum,
+                            library_nickname='junos-eznc (aka PyEZ)')
+        if check_device is True:
+            if HAS_PYEZ_DEVICE is False:
+                self.fail_json(msg='junos-eznc (aka PyEZ) is installed, but '
+                                   'the jnpr.junos.device.Device class could '
+                                   'not be imported.')
+        if check_sw is True:
+            if HAS_PYEZ_SW is False:
+                self.fail_json(msg='junos-eznc (aka PyEZ) is installed, but '
+                                   'the jnpr.junos.utils.sw class could '
+                                   'not be imported.')
+        if check_config is True:
+            if HAS_PYEZ_CONFIG is False:
+                self.fail_json(msg='junos-eznc (aka PyEZ) is installed, but '
+                                   'the jnpr.junos.utils.config class could '
+                                   'not be imported.')
+        if check_op_table is True:
+            if HAS_PYEZ_OP_TABLE is False:
+                self.fail_json(msg='junos-eznc (aka PyEZ) is installed, but '
+                                   'the jnpr.junos.op class could not be '
+                                   'imported.')
+        if check_exception is True:
+            if HAS_PYEZ_EXCEPTIONS is False:
+                self.fail_json(msg='junos-eznc (aka PyEZ) is installed, but '
+                                   'the jnpr.junos.exception module could not '
+                                   'be imported.')
+
+    def check_jsnapy(self, minimum=None):
+        """Check jsnapy is available and version is >= minimum.
+
+        Args:
+            minimum: The minimum jsnapy version required.
+                     Default = None which means no version check.
+
+        Failures:
+            - jsnapy not installed.
+            - jsnapy version < minimum.
+        """
+        self._check_library('jsnapy', HAS_JSNAPY_VERSION,
+                            JSNAPY_INSTALLATION_URL, minimum=minimum)
+
+    def check_jxmlease(self, minimum=None):
+        """Check jxmlease is available and version is >= minimum.
+
+        Args:
+            minimum: The minimum jxmlease version required.
+                     Default = None which means no version check.
+
+        Failures:
+            - jxmlease not installed.
+            - jxmlease version < minimum.
+        """
+        self._check_library('jxmlease', HAS_JXMLEASE_VERSION,
+                            JXMLEASE_INSTALLATION_URL, minimum=minimum)
+
+    def check_lxml_etree(self, minimum=None):
+        """Check lxml etree is available and version is >= minimum.
+
+        Args:
+            minimum: The minimum lxml version required.
+                     Default = None which means no version check.
+
+        Failures:
+            - lxml not installed.
+            - lxml version < minimum.
+        """
+        self._check_library('lxml Etree', HAS_LXML_ETREE_VERSION,
+                            LXML_ETREE_INSTALLATION_URL, minimum=minimum)
+
+    def check_yaml(self, minimum=None):
+        """Check yaml is available and version is >= minimum.
+
+        Args:
+            minimum: The minimum PyYAML version required.
+                     Default = None which means no version check.
+
+        Failures:
+            - yaml not installed.
+            - yaml version < minimum.
+        """
+        self._check_library('yaml', HAS_YAML_VERSION,
+                            YAML_INSTALLATION_URL, minimum=minimum)
+
+    def open_configuration(self, mode, ignore_warning=None):
+        """Open candidate configuration database in exclusive or private mode.
+
+        Failures:
+            - ConnectError: When there's a problem with the PyEZ connection.
+            - RpcError: When there's a RPC problem including an already locked
+                        config or an already opened private config.
+        """
+
+        ignore_warn = ['uncommitted changes will be discarded on exit']
+        # if ignore_warning is a bool, pass the bool
+        # if ignore_warning is a string add to the list
+        # if ignore_warning is a list, merge them
+        if ignore_warning != None and isinstance(ignore_warning, bool):
+            ignore_warn = ignore_warning
+        elif ignore_warning != None and isinstance(ignore_warning, str):
+            ignore_warn.append(ignore_warning)
+        elif ignore_warning != None and isinstance(ignore_warning, list):
+            ignore_warn = ignore_warn + ignore_warning
+
+        # Already have an open configuration?
+        if self.config is None:
+            if mode not in CONFIG_MODE_CHOICES:
+                self.fail_json(msg='Invalid configuration mode: %s' % (mode))
+            if self.dev is None:
+                self.open()
+            config = jnpr.junos.utils.config.Config(self.dev, mode=mode)
+            try:
+                if config.mode == 'exclusive':
+                    config.lock()
+                elif config.mode == 'private':
+                    self.dev.rpc.open_configuration(
+                        private=True,
+                        ignore_warning=ignore_warn)
+            except (pyez_exception.ConnectError,
+                    pyez_exception.RpcError) as ex:
+                self.fail_json(msg='Unable to open the configuration in %s '
+                                   'mode: %s' % (config.mode, str(ex)))
+            self.config = config
+            self.logger.debug("Configuration opened in %s mode.", config.mode)
+
+    def close_configuration(self):
+        """Close candidate configuration database.
+
+        Failures:
+            - ConnectError: When there's a problem with the PyEZ connection.
+            - RpcError: When there's a RPC problem closing the config.
+        """
+        if self.config is not None:
+            # Because self.fail_json() calls self.close_configuration(), we
+            # must set self.config = None BEFORE closing the config in order to
+            # avoid the infinite recursion which would occur if closing the
+            # configuration raised an exception.
+            config = self.config
+            self.config = None
+            try:
+                if config.mode == 'exclusive':
+                    config.unlock()
+                elif config.mode == 'private':
+                    self.dev.rpc.close_configuration()
+                self.logger.debug("Configuration closed.")
+            except (pyez_exception.ConnectError,
+                    pyez_exception.RpcError) as ex:
+                self.fail_json(msg='Unable to close the configuration: %s' %
+                                   (str(ex)))
+
+    def check_configuration(self):
+        """Check the candidate configuration.
+
+        Check the configuration. Assumes the configuration is already opened.
+        Performs the equivalent of a "commit check", but does NOT commit the
+        configuration.
+
+        Failures:
+            - An error returned from checking the configuration.
+        """
+        if self.dev is None or self.config is None:
+            self.fail_json(msg='The device or configuration is not open.')
+
+        self.logger.debug("Checking the configuration.")
+        try:
+            self.config.commit_check()
+            self.logger.debug("Configuration checked.")
+        except (self.pyez_exception.RpcError,
+                self.pyez_exception.ConnectError) as ex:
+            self.fail_json(msg='Failure checking the configuraton: %s' %
+                               (str(ex)))
+
+    def diff_configuration(self):
+        """Diff the candidate and committed configurations.
+
+        Diff the candidate and committed configurations.
+
+        Returns:
+            A string with the configuration differences in text "diff" format.
+
+        Failures:
+            - An error returned from diffing the configuration.
+        """
+        if self.dev is None or self.config is None:
+            self.fail_json(msg='The device or configuration is not open.')
+
+        self.logger.debug("Diffing candidate and committed configurations.")
+        try:
+            diff = self.config.diff(rb_id=0)
+            self.logger.debug("Configuration diff completed.")
+            return diff
+        except (self.pyez_exception.RpcError,
+                self.pyez_exception.ConnectError) as ex:
+            self.fail_json(msg='Failure diffing the configuraton: %s' %
+                               (str(ex)))
+
+    def load_configuration(self,
+                           action,
+                           lines=None,
+                           src=None,
+                           template=None,
+                           vars=None,
+                           url=None,
+                           ignore_warning=None,
+                           format=None):
+        """Load the candidate configuration.
+
+        Load the candidate configuration from the specified src file using the
+        specified action.
+
+        Args:
+            action - The type of load to perform: 'merge', 'replace', 'set',
+                                                  'override', 'overwrite', and
+                                                  'update'
+            lines - A list of strings containing the configuration.
+            src - The file path on the local Ansible control machine to the
+                  configuration to be loaded.
+            template - The Jinja2 template used to renter the configuration.
+            vars - The variables used to render the template.
+            url - The URL to the candidate configuration.
+            ignore_warning - What warnings to ignore.
+            format - The format of the configuration being loaded.
+
+        Failures:
+            - An error returned from loading the configuration.
+        """
+        if self.dev is None or self.config is None:
+            self.fail_json(msg='The device or configuration is not open.')
+
+        load_args = {}
+        config = None
+        if ignore_warning is not None:
+            load_args['ignore_warning'] = ignore_warning
+        if action == 'set':
+            format = 'set'
+        if format is not None:
+            load_args['format'] = format
+        if action == 'merge':
+            load_args['merge'] = True
+        if action == 'override' or action == 'overwrite':
+            load_args['overwrite'] = True
+        if action == 'update':
+            load_args['update'] = True
+        if lines is not None:
+            config = '\n'.join(map(lambda line: line.rstrip('\n'), lines))
+            self.logger.debug("Loading the supplied configuration.")
+        if src is not None:
+            load_args['path'] = src
+            self.logger.debug("Loading the configuration from: %s.", src)
+        if template is not None:
+            load_args['template_path'] = template
+            load_args['template_vars'] = vars
+            self.logger.debug("Loading the configuration from the %s "
+                              "template.", template)
+        if url is not None:
+            load_args['url'] = url
+            self.logger.debug("Loading the configuration from %s.", url)
+
+        try:
+            if config is not None:
+                self.config.load(config, **load_args)
+            else:
+                self.logger.debug("Load args %s.", str(load_args))
+                self.config.load(**load_args)
+            self.logger.debug("Configuration loaded.")
+        except (self.pyez_exception.RpcError,
+                self.pyez_exception.ConnectError) as ex:
+            self.fail_json(msg='Failure loading the configuraton: %s' %
+                               (str(ex)))
+
+    def commit_configuration(self, ignore_warning=None, comment=None,
+                             confirmed=None):
+        """Commit the candidate configuration.
+
+        Commit the configuration. Assumes the configuration is already opened.
+
+        Args:
+            ignore_warning - Which warnings to ignore.
+            comment - The commit comment
+            confirmed - Number of minutes for commit confirmed.
+
+        Failures:
+            - An error returned from committing the configuration.
+        """
+        if self.dev is None or self.config is None:
+            self.fail_json(msg='The device or configuration is not open.')
+
+        self.logger.debug("Committing the configuration.")
+        try:
+            self.config.commit(ignore_warning=ignore_warning,
+                               comment=comment,
+                               confirm=confirmed)
+            self.logger.debug("Configuration committed.")
+        except (self.pyez_exception.RpcError,
+                self.pyez_exception.ConnectError) as ex:
+            self.fail_json(msg='Failure committing the configuraton: %s' %
+                               (str(ex)))
+
+    def ping(self, params, acceptable_percent_loss=0, results={}):
+        """Execute a ping command with the parameters specified in params.
+
+        Args:
+            params: dict of parameters passed directly to the ping RPC.
+            acceptable_percent_loss: integer specifying maximum percentage of
+                                     packets that may be lost and still
+                                     consider the ping not to have failed.
+            results: dict of results which should be included in the return
+                     value, or which should be included if fail_json() is
+                     called due to a failure.
+
+        Returns:
+            A dict of results. It contains all key/value pairs in the results
+            argument plus the keys below. (The keys below will overwrite
+            any corresponding key which exists in the results argument):
+
+            msg: (str) A human-readable message indicating the result.
+            packet_loss: (str) The percentage of packets lost.
+            packets_sent: (str) The number of packets sent.
+            packets_received: (str) The number of packets received.
+            rtt_minimum: (str) The minimum round-trip-time, in microseconds,
+                               of all ping responses received.
+            rtt_maximum: (str) The maximum round-trip-time, in microseconds,
+                               of all ping responses received.
+            rtt_average: (str) The average round-trip-time, in microseconds,
+                               of all ping responses received.
+            rtt_stddev: (str) The standard deviation of round-trip-time, in
+                              microseconds, of all ping responses received.
+            warnings: (list of str) A list of warning strings, if any, produced
+                                    from the ping.
+            failed: (bool) Indicates if the ping failed. The ping fails
+                           when packet_loss > acceptable_percent_loss.
+
+        Fails:
+            - If the ping RPC produces an exception.
+            - If there are errors present in the results.
+        """
+        # Assume failure until we know success.
+        results['failed'] = True
+
+        # Execute the ping.
+        try:
+            self.logger.debug("Executing ping with parameters: %s",
+                              str(params))
+            resp = self.dev.rpc.ping(normalize=True, **params)
+            self.logger.debug("Ping executed.")
+        except (self.pyez_exception.RpcError,
+                self.pyez_exception.ConnectError) as ex:
+            self.fail_json(msg='Unable to execute ping: %s' % (str(ex)))
+
+        if not isinstance(resp, self.etree._Element):
+            self.fail_json(msg='Unexpected ping response: %s' % (str(resp)))
+
+        resp_xml = self.etree.tostring(resp, pretty_print=True)
+
+        # Fail if any errors in the results
+        errors = resp.findall(
+            "rpc-error[error-severity='error']/error-message")
+        if len(errors) != 0:
+            # Create a comma-plus-space-seperated string of the errors.
+            # Calls the text attribute of each element in the errors list.
+            err_msg = ', '.join(map(lambda err: err.text, errors))
+            results['msg'] = "Ping returned errors: %s" % (err_msg)
+            self.exit_json(**results)
+
+        # Add any warnings into the results
+        warnings = resp.findall(
+            "rpc-error[error-severity='warning']/error-message")
+        if len(warnings) != 0:
+            # Create list of the text attributes of each element in the
+            # warnings list.
+            results['warnings'] = list(map(lambda warn: warn.text, warnings))
+
+        # Try to find probe summary
+        probe_summary = resp.find('probe-results-summary')
+        if probe_summary is None:
+            results['msg'] = "Probe-results-summary not found in response: " \
+                             "%s" % (resp_xml)
+            self.exit_json(**results)
+
+        # Extract some required fields and some optional fields
+        r_fields = {}
+        r_fields['packet_loss'] = probe_summary.findtext('packet-loss')
+        r_fields['packets_sent'] = probe_summary.findtext('probes-sent')
+        r_fields['packets_received'] = probe_summary.findtext(
+            'responses-received')
+        o_fields = {}
+        o_fields['rtt_minimum'] = probe_summary.findtext('rtt-minimum')
+        o_fields['rtt_maximum'] = probe_summary.findtext('rtt-maximum')
+        o_fields['rtt_average'] = probe_summary.findtext('rtt-average')
+        o_fields['rtt_stddev'] = probe_summary.findtext('rtt-stddev')
+
+        # Make sure we got values for required fields.
+        for key in r_fields:
+            if r_fields[key] is None:
+                results['msg'] = 'Expected field %s not found in ' \
+                                 'response: %s' % (key, resp_xml)
+                self.exit_json(**results)
+        # Add the required fields to the result.
+        results.update(r_fields)
+
+        # Extract integer packet loss
+        packet_loss = 100
+        if results['packet_loss'] is not None:
+            try:
+                packet_loss = int(results['packet_loss'])
+            except ValueError:
+                results['msg'] = 'Packet loss %s not an integer. ' \
+                                 'Response: %s' % \
+                                 (results['packet_loss'], resp_xml)
+                self.exit_json(**results)
+
+        if packet_loss < 100:
+            # Optional fields are present if packet_loss < 100
+            for key in o_fields:
+                if o_fields[key] is None:
+                    results['msg'] = 'Expected field %s not found in ' \
+                                     'response: %s' % (key, resp_xml)
+                    self.exit_json(**results)
+        # Add the o_fields to the result (even if they're None)
+        results.update(o_fields)
+
+        # Set the result message.
+        results['msg'] = 'Loss %s%%, (Sent %s | Received %s)' % \
+                         (results['packet_loss'],
+                          results['packets_sent'],
+                          results['packets_received'])
+
+        # Was packet loss within limits? If so, we didn't fail.
+        if packet_loss <= acceptable_percent_loss:
+            results['failed'] = False
+
+        return results
+
+    def save_text_output(self, name, format, text):
+        """Save text output into a file based on 'dest' and 'dest_dir' params.
+
+        The text provided in the text parameter is saved to a file on the
+        local Ansible control machine based on the 'diffs_file', 'dest', and
+        'dest_dir' module parameters. If neither parameter is specified,
+        then this method is a no-op. If the 'dest' or 'diffs_file' parameter is
+        specified, the value of the 'dest' or 'diffs_file' parameter is used as
+        the path name for the destination file. In this case, the name and
+        format parameters are ignored. If the 'dest_dir' parameter is
+        specified, the path name for the destination file is:
+        <hostname>_<name>.<format>.  If the destination file already exists,
+        and the 'dest_dir' option is specified, or the 'dest' parameter is
+        specified and the self.destfile attribute is not present, the file is
+        overwritten. If the 'dest' parameter is specified and the
+        self.destfile attribute is present, then the file is appended. This
+        allows multiple text outputs to be written to the same file.
+
+        Args:
+            name: The name portion of the destination filename when the
+                  'dest_dir' parameter is specified.
+            format: The format portion of the destination filename when the
+                  'dest_dir' parameter is specified.
+            text: The text to be written into the destination file.
+
+        Fails:
+            - If the destination file is not writable.
+        """
+        file_path = None
+        mode = 'wb'
+        if name == 'diff':
+            if self.params.get('diffs_file') is not None:
+                file_path = os.path.normpath(self.params.get('diffs_file'))
+            elif self.params.get('dest_dir') is not None:
+                dest_dir = self.params.get('dest_dir')
+                hostname = self.params.get('host')
+                file_name = '%s.diff' % (hostname)
+                file_path = os.path.normpath(os.path.join(dest_dir, file_name))
+        else:
+            if self.params.get('dest') is not None:
+                file_path = os.path.normpath(self.params.get('dest'))
+                if getattr(self, 'destfile', None) is None:
+                    self.destfile = self.params.get('dest')
+                else:
+                    mode = 'ab'
+            elif self.params.get('dest_dir') is not None:
+                dest_dir = self.params.get('dest_dir')
+                hostname = self.params.get('host')
+                # Substitute underscore for spaces.
+                name = name.replace(' ', '_')
+                # Substitute underscore for pipe
+                name = name.replace('|', '_')
+                name = '' if name == 'config' else '_' + name
+                file_name = '%s%s.%s' % (hostname, name, format)
+                file_path = os.path.normpath(os.path.join(dest_dir, file_name))
+        if file_path is not None:
+            try:
+                # Use ansible utility to convert objects to bytes
+                # to achieve Python2/3 compatibility
+                with open(file_path, mode) as save_file:
+                    save_file.write(to_bytes(text, encoding='utf-8'))
+                self.logger.debug("Output saved to: %s.", file_path)
+            except IOError:
+                self.fail_json(msg="Unable to save output. Failed to "
+                                   "open the %s file." % (file_path))
+
+    def parse_arg_to_list_of_dicts(self,
+                                   option_name,
+                                   string_val,
+                                   allow_bool_values=False):
+        """Parses string_val into a list of dicts with bool and/or str values.
+        In order to handle all of the different ways that list of dict type
+        options may be specified, the arg_spec must set the option type to
+        'str'. This requires us to parse the string_val ourselves into the
+        required list of dicts. Handles Ansible-style keyword=value format for
+        specifying dictionaries. Also handles Ansible aliases for boolean
+        values if allow_bool_values is True.
+        Args:
+            option_name - The name of the option being parsed.
+            string_val - The string to be parse.
+            allow_bool_values - Whether or not boolean values are allowed.
+        Returns:
+            The list of dicts
+        Fails:
+            If there is an error parsing
+        """
+        # Nothing to do if no string_val were specified.
+        if string_val is None:
+            return None
+
+        # Evaluate the string
+        kwargs = self.safe_eval(string_val)
+
+        if isinstance(kwargs, basestring):
+            # This might be a keyword1=value1 keyword2=value2 type string.
+            # The _check_type_dict method will parse this into a dict for us.
+            try:
+                kwargs = self._check_type_dict(kwargs)
+            except TypeError as exc:
+                self.fail_json(msg="The value of the %s option (%s) is "
+                                   "invalid. Unable to translate into "
+                                   "a list of dicts." %
+                                   (option_name, string_val, str(exc)))
+
+        # Now, if it's a dict, let's make it a list of one dict
+        if isinstance(kwargs, dict):
+            kwargs = [kwargs]
+        # Now, if it's not a list, we've got a problem.
+        if not isinstance(kwargs, list):
+            self.fail_json(msg="The value of the %s option (%s) is invalid. "
+                               "Unable to translate into a list of dicts." %
+                               (option_name, string_val))
+        # We've got a list, traverse each element to make sure it's a dict.
+        return_val = []
+        for kwarg in kwargs:
+            # If it's now a string, see if it can be parsed into a dictionary.
+            if isinstance(kwarg, basestring):
+                # This might be a keyword1=value1 keyword2=value2 type string.
+                # The _check_type_dict method will parse this into a dict.
+                try:
+                    kwarg = self._check_type_dict(kwarg)
+                except TypeError as exc:
+                    self.fail_json(msg="The value of the %s option (%s) is "
+                                       "invalid. Unable to translate into a "
+                                       "list of dicts." %
+                                       (option_name, string_val, str(exc)))
+            # Now if it's not a dict, there's a problem.
+            if not isinstance(kwarg, dict):
+                self.fail_json(msg="The value of the kwargs option (%s) is "
+                                   "invalid. Unable to translate into a list "
+                                   "of dicts." %
+                                   (option_name, string_val))
+            # Now we just need to make sure the key is a string and the value
+            # is a string or bool.
+            return_item = {}
+            for (k, v) in kwarg.items():
+                if not isinstance(k, basestring):
+                    self.fail_json(msg="The value of the %s option (%s) "
+                                       "is invalid. Unable to translate into "
+                                       "a list of dicts." %
+                                       (option_name, string_val))
+                if allow_bool_values is True:
+                    # Try to convert it to a boolean value. Will be None if it
+                    # can't be converted.
+                    try:
+                        bool_val = boolean(v)
+                    except TypeError:
+                        bool_val = None
+                    if bool_val is not None:
+                        v = bool_val
+                return_item[k] = v
+            return_val.append(return_item)
+        return return_val
+
+    def _setup_logging(self):
+        """Setup logging for the module.
+        Performs several tasks to setup logging for the module. This includes:
+        1) Creating a Logger instance object for the name
+           jnpr.ansible_module.<mod_name>.
+        2) Sets the level for the Logger object depending on verbosity and
+           debug settings specified by the user.
+        3) Sets the level for other Logger objects specified in
+           additional_logger_names depending on verbosity and
+           debug settings specified by the user.
+        4) If the logfile or logdir option is specified, attach a FileHandler
+           instance which logs messages from jnpr.ansible_module.<mod_name> or
+           any of the names in additional_logger_names.
+        Returns:
+            Logger instance object for the name jnpr.ansible_module.<mod_name>.
+        """
+        class CustomAdapter(logging.LoggerAdapter):
+            """
+            Prepend the hostname, in brackets, to the log message.
+            """
+            def process(self, msg, kwargs):
+                return '[%s] %s' % (self.extra['host'], msg), kwargs
+
+        # Default level to log.
+        level = logging.WARNING
+        # Log more if ANSIBLE_DEBUG or -v[v] is set.
+        if self._debug is True:
+            level = logging.DEBUG
+        elif self._verbosity == 1:
+            level = logging.INFO
+        elif self._verbosity > 1:
+            level = logging.DEBUG
+        # Set level as mentioned in task
+        elif self.params.get('level') is not None:
+            level = self.params.get('level')
+        # Get the logger object to be used for our logging.
+        logger = logging.getLogger('jnpr.ansible_module.' + self.module_name)
+        # Attach the NullHandler to avoid any errors if no logging is needed.
+        logger.addHandler(logging.NullHandler())
+        # Set the logging level for the modules logging. This will also control
+        # the amount of logging which goes into Ansible's log file.
+        logger.setLevel(level)
+        # Set the logging level for additional names. This will also control
+        # the amount of logging which goes into Ansible's log file.
+        for name in additional_logger_names:
+            logging.getLogger(name).setLevel(level)
+        # Get the name of the logfile based on logfile or logdir options.
+        logfile = None
+        if self.params.get('logfile') is not None:
+            logfile = self.params.get('logfile')
+        elif self.params.get('logdir') is not None:
+            logfile = os.path.normpath(self.params.get('logdir') + '/' +
+                                       self.params.get('host') + '.log')
+        # Create the FileHandler and attach it.
+        if logfile is not None:
+            try:
+                handler = logging.FileHandler(logfile, mode='a')
+                handler.setLevel(level)
+                # Create a custom formatter.
+                formatter = logging.Formatter(
+                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                # add formatter to handler
+                handler.setFormatter(formatter)
+                # Handler should log anything from the 'jnpr.ansible_module.' namespace to
+                # catch PyEZ, JSNAPY, etc. logs.
+                logger.addHandler(handler)
+                for name in additional_logger_names:
+                    logging.getLogger(name).addHandler(handler)
+            except IOError as ex:
+                self.fail_json(msg="Unable to open the log file %s. %s" %
+                                   (logfile, str(ex)))
+        # Use the CustomAdapter to add host information.
+        return CustomAdapter(logger, {'host': self.params.get('host')})
+
+    def get_config(self, filter_xml=None, options=None):
+        response = self._pyez_conn.get_config(filter_xml, options)
+        return self.etree.fromstring(response)
+
+    # def get_dev_object(self):
+    #     self.dev = pickle.loads(to_bytes(self._pyez_conn.get_dev_obj()))
+    #     return self.dev
