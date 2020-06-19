@@ -34,7 +34,6 @@ The following example task take pre and post snapshot and check for conditions, 
 
 ```yaml
 ---
----
 - hosts: junos
   gather_facts: no
   connection: junipernetworks.pyez.pyez
