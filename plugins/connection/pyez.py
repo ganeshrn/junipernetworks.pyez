@@ -147,8 +147,11 @@ options:
     vars:
     - name: ansible_pyez_ssh_config
 """
-import pickle
+from functools import partial
 
+from ansible.module_utils.six import PY3
+from ansible.module_utils.six.moves import cPickle
+from ansible.playbook.play_context import PlayContext
 from ansible.errors import AnsibleConnectionFailure, AnsibleError
 from ansible.module_utils._text import to_bytes, to_native, to_text
 from ansible.plugins.connection import NetworkConnectionBase, ensure_connect
@@ -248,7 +251,7 @@ from ansible_collections.ansible.netcommon.plugins.module_utils.network.common.u
 
 # Supported configuration modes
 CONFIG_MODE_CHOICES = ['exclusive', 'private']
-
+import q
 
 class Connection(NetworkConnectionBase):
     """NetConf connections"""
@@ -259,6 +262,43 @@ class Connection(NetworkConnectionBase):
     def __init__(self, play_context, new_stdin, *args, **kwargs):
         super(Connection, self).__init__(play_context, new_stdin, *args, **kwargs)
         self.dev = None
+
+    def __getattr__(self, name):
+        try:
+            q(name)
+            return self.__dict__[name]
+
+        except KeyError:
+            # restrict invoking private methods
+            if name not in ["update_play_context", "set_check_prompt"]:
+                if name.startswith('_'):
+                    raise AttributeError("'%s' object has no attribute '%s'" % (self.__class__.__name__, name))
+                return partial(self.__rpc__, name)
+            else:
+                pass
+
+    # def get_config(self, filter_xml=None, options=None):
+    #     resp = self.dev.rpc.get_config(filter_xml=filter_xml, options=options)
+    #     return etree.tostring(resp)
+
+    def __rpc__(self, name, *args, **kwargs):
+        """
+        :param name:
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        resp = ""
+        q("--rpc--")
+        q(name)
+        q(args)
+        q(kwargs)
+        if hasattr(self.dev.rpc, name):
+            rpc_obj = getattr(self.dev.rpc, name)
+            q(rpc_obj)
+            resp = rpc_obj(*args, **kwargs)
+            q(resp)
+            return etree.tostring(resp)
 
     @property
     @ensure_connect
@@ -344,14 +384,6 @@ class Connection(NetworkConnectionBase):
     @ensure_connect
     def get_capabilities(self):
         return json.dumps({'network_api': 'pyez'})
-
-    def get_config(self, filter_xml=None, options=None):
-        resp = self.dev.rpc.get_config(filter_xml=filter_xml, options=options)
-        return etree.tostring(resp)
-
-    # def get_dev_object(self):
-    #     obj = to_bytes(pickle.dumps(self.dev))
-    #     return obj
 
     def invoke_jsnapy(self, data, action):
         try:
